@@ -25,7 +25,8 @@ class Value : public Node {
   static Value* constValue(Number v);
   static Value* lookupValue(int name);
   
-  static int Value::calcLen(int v);
+  // static int Value::calcLen(int v);
+  static int calcLen(int v);
   
 };
 
