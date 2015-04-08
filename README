@@ -1,0 +1,323 @@
+
+==================================================
+
+		k2asm - 6502 Cross Assembler
+
+			  Version 1.0 beta
+
+		  (c) Boerje Sieling 2003
+
+==================================================
+  
+k2asm is a powerfull 6502 Cross Assembler with
+enhanced features for larger assembler projects.
+Currently, its main purpose is the development
+of c64 demos and has already tested in practical use.
+
+k2asm compiles on Linux and should also run on
+other Posix like platforms, a win32 port is
+not planned but welcome.
+Its entirely written in c++ and should work
+with any ansi c++ compliant compiler.
+
+k2asm brings its own preprocessor k2pp (c) Hauke Brandes 2003, 
+entirely written in python 2.1 and higher.
+
+Additionaly there is the linker k2link (c) Andre Kaesmacher
+which can be used to create one-file executable
+from many objects.
+
+
+Invoking k2asm:
+===============
+
+k2asm [-o outfile] [-x exports] [-k] [-v] infile
+
+	  -o  : output file
+	  -x  : export definitions
+	  -k  : use preprocessor (k2pp)
+	  -v  : show version information
+	  -d  : pretty print unstripped code 
+
+
+Opcodes:
+========
+
+All standard opcodes and addressing modes
+are supported in the well known syntax.
+
+Exceptions are:
+Accu addressing mode is written without the 'a'
+
+	lsr
+
+instead of
+	
+	lsr a
+
+See also BUGS section for another exception
+
+Immidiate is supported with or without
+<space> between opcode and #
+
+		lda #10  ; correct syntax
+		lda#10   ; alsó correct syntax
+
+Comments are written like:
+
+		 ; this is a comment
+		 
+		 lda #10  ; this also
+
+
+Illegal opcodes are currently not supported but
+are planned for the next release.
+
+
+Expressions:
+============
+<string>::=   '"'[.]*'"' 
+<hex>	::=   $[0-9a-fA-F]+
+<bin>	::=   %[01]+
+<dec>	::=   [0-9]+
+<ident> ::=   [a-zA-Z_]+
+<op>    ::=   '+' | '-' | '*' | '/' | '%' | '|' | '&' 
+<exp>   ::=	  <exp> <op> <exp> | <hex> | <dec> | <bin> | <ident> | ( <exp> ) | '*'
+
+(* = current address)
+
+
+Pseudo Opcodes:
+===============
+
+.org   <exp>			start adress
+.byte  <exp> [,<exp>]	byte value list
+.word  <exp> [,<exp>]	word value list
+.buf   <exp> [<exp>]	<exp> bytes padded with 0 or 2nd <exp>
+.align <exp> [<exp>]	aligned to <exp> byte boundary padded with 0 or 2nd <exp>
+.file  <string> , <dec> set file, line (for error output) 
+
+String Encoding
+===============
+
+.encoding "file"		load encoding from file
+.enc <string> | <exp> [ , <string> | <exp> ]  
+	 byte values of bytes or characters according
+	 to loaded selected encoding table
+
+
+File format of encodings:
+
+<empty line> | '#' .* | <dec> ':' <dec> [ '#' .* ]
+
+
+Example encoding file
+-------------------
+
+# comment
+65 : 1	# map 'a' (ascii) to 'a' (petscii)
+..
+
+Example encoding usage:
+-----------------------
+
+    .encoding "petscii.enc"		; load petscii encoding
+	.enc "Hello World",0		; zero terminated string, encoded in petscii
+
+	...
+ 
+	.encoding "custom.enc"		; load new custom encoding
+	.enc "Hello World",0		; zero terminated string, encoded customly
+
+
+Definitions
+===========
+
+<ident> = <exp>
+
+Labels
+======
+
+<ident>:
+   simple label
+
+
+Global and exported Labels/definitions
+======================================
+
+.export <ident>:
+exports the label <ident>
+
+.export <ident> = <exp>
+exports <ident> as <exp>
+
+.global <ident>:
+makes <indent> visible in the whole file 
+
+.global <ident> = <exp>
+makes <indent> visible in the whole file 
+
+
+Anonymous Scopes:
+=================
+  {
+    code, labels, definitions
+  }
+  
+
+all labels/definitions are visible only inside { }
+
+Implicit Labels
+---------------
+(those are only vaild inside a scope, see Scopes section)
+
+_break			end of scope
+_cont			start of scope
+
+the labels can be assumed as followed:
+
+   {
+    _cont:
+
+     code, ..
+
+    _break:
+   }
+
+
+Named Scopes:
+=============
+
+  .scope <ident> {
+
+
+  }
+
+defines a scope named <ident>; <ident> will be exported
+and defines a "namespace" (all exported/global inner idents are
+prefixed with <ident>. )
+
+Additionaly <ident>._end is exported which is the
+end of the scope. So the legnth in bytes of
+a named scope is always 
+
+  <ident>._end - <ident>
+
+Example:
+--------
+
+  .scope outer {
+
+     .scope inner {
+	   .global x = $10;
+	   .export label_adr = label
+       .export label:
+     }
+
+	 jmp inner ; 'inner' is visible here
+  }
+
+  lda outer.inner.x ; 'x' is only visible through outer.inner
+  jmp outer.inner ; 'innser' is only visible through 'outer'
+
+The example exports the following definitions:
+
+outer = <outer address>
+outer._end = <end address of outer scope>
+outer.inner = <inner address>
+outer.inner._end = <end address of inner scope>
+outer.inner.label = <label address>
+outer.inner.label_adr = <label address>
+
+outer.inner.x is NOT exported !
+
+Why Scopes ?
+============
+
+Scopes help the coder to manage the large amount of lables
+and use standard naming conventions for labels with
+identical semantics.
+Additionaly implicit labels reduce the amount of
+labels like 'loop:' and 'endloop:'
+
+Scopes allow to use local labels in macros, so
+make shure to write macros this way:
+
+#begindef mymacro(param)
+{
+  cmp #param
+  beq label:
+  ..
+  label:      ; label is protected by the scope
+  ..
+}
+#enddef
+
+
+Named scopes help to modularise code and make
+it more reusable, so libraries and utilities
+can be placed in named scopes and define
+standard names and symbols without intersection
+with other code fragments (see 2nd example below)
+
+
+
+Examples
+========
+
+Example loop:
+-------------
+
+   ; simple 9 to 0 counting loop
+   ; width addional loop exit on accu = 5
+
+   lda #10 {
+     dex
+     do something ...
+     cmp #5				; test some additional ending condition
+	 beq _break			; break to the end of loop
+	 cpx #0				; test loop count
+     bne _cont			; continiue if no 0
+   }
+
+Example Program using scopes:
+-----------------------------
+
+   .org $c000
+
+   jsr my_prog.init
+   jsr my_prog.run
+   rts
+
+   .scope my_prog {
+
+     .scope init {
+        init my program ..
+     } rts
+
+     .scope run {
+	    run my program ..
+     } rts
+	 
+   }
+
+Local named scopes:
+-------------------
+
+There is no special syntax for non-exported named scopes,
+just use this way to declare them:
+
+	 my_local_scope: {
+
+	   ...
+
+	 }
+
+
+
+Known BUGS:
+===========
+ + no include path for encodings (only current directory 
+   searched; K2PP_INCLUDEPATH should be used)
+ + no default compiled-in encoding (should be petscii)
+

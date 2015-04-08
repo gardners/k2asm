@@ -1,0 +1,1122 @@
+#!/usr/bin/env python
+import sys,os,getopt,re,os.path
+from types import StringType
+
+prog_name="k2pp"
+prog_release="0.2"
+file_revision="$Revision: 1.30 $"
+
+class Null:
+	"""Pseudo-File Objekt, um Ausgaben zu verhindern"""
+	def write(this, *args):
+		pass
+	pass
+
+class PPException (Exception):
+	"""Standardklasse fuer Praeprozessor-spezifische Exceptions"""
+	def __init__(this, msg):
+		Exception.__init__(this)
+		this.message = msg
+		pass
+	pass
+
+class Log:
+	"""Klasse fuer alle informativen Ausgaben"""
+	def __init__(this):
+		this.out = sys.stderr
+		this.inp = None
+		this.errorOccured = 0
+		return
+
+	def setOutput(this, out):
+		this.out = out
+		pass
+	
+	def setInput(this, inp):
+		this.inp = inp
+		pass
+
+	def _pos(this):
+		if not this.inp: return
+		pos = this.inp.getPosition()
+		if not len(pos): return
+		this.out.write("%s:%i: " % pos[0])
+		pass
+
+	def warning(this, msg):
+		this._pos()
+		this.out.write("WARNING: %s\n" % msg)
+		pass
+
+	def error(this, msg):
+		this._pos()
+		this.out.write("ERROR: %s\n" % msg)
+		this.errorOccured = 1
+		pass
+
+	def debug(this, msg):
+		return
+		this._pos()
+		this.out.write("DEBUG: %s\n" % msg)
+		pass
+
+	pass
+
+
+class Input:
+	"""Class encapsulates all preprocessor input"""
+
+	def __init__(this, filename):
+		this.filename = filename
+		this.file = None
+		this.file_read = 0
+		this.linenr = 0
+		this.includeInput = None
+		pass
+
+	def _open(this):
+		this.file = open(this.filename)
+		pass
+
+	def getLine(this):
+		if this.includeInput: 
+			res = this.includeInput.getLine()
+			if res != "": return res
+			this.includeInput = None
+			pass
+
+		if this.file_read: return ""
+
+		if not this.file:
+			try:
+				this._open()
+			except:
+				log.error("Could not open input '%s'" % this.filename)
+				this.file_read = 1
+				return ""
+			pass
+		
+		res = this.file.readline()
+		this.linenr+=1
+		if len(res) == 0:
+			failure = this.file.close()
+			this.file_read = 1
+			if failure: log.error("Error closing input stream")
+			pass
+		return res
+
+	def getPosition(this):
+		if not this.includeInput:
+			return [ (this.filename, this.linenr) ]
+		
+		res = this.includeInput.getPosition()
+		res.append( (this.filename, this.linenr) )
+		return res
+	
+	def include(this,inp):
+		if this.includeInput: return this.includeInput.include(inp)
+		this.includeInput = inp
+		return
+
+	pass
+
+
+class PipeInput (Input):
+	"""Klasse zum Lesen der Eingabe aus einer Pipe"""
+	def _open(this):
+		this.file = os.popen(this.filename)
+		pass
+	
+	def getPosition(this):
+		name = "<%s>" % this.filename.strip()
+		if not this.includeInput:
+			return [ ( name, this.linenr) ]
+
+		res = this.includeInput.getPosition()
+		res.append( ( name, this.linenr) )
+		return res
+	
+	pass
+
+class StreamInput (Input):
+	"""Liest die Eingabe aus einem bereits geoeffneten Python-Stream"""
+	def __init__(this, stream):
+		this.stream = stream
+		this.filename = stream.name
+		this.file = None
+		this.file_read = 0
+		this.linenr = 0
+		this.includeInput = None
+		pass
+	
+	def _open(this):
+		this.file = this.stream
+		pass
+	
+	pass
+
+
+class Token:
+	NOTOKEN=0
+	IDENT=1
+	NUMBER=2
+	SYMBOL=3
+	STRING=4
+	WHITESPACE=5
+	COMMENT=6
+	DIRECTIVE=7
+	QUOTEDCHAR=8
+	typeNames = ["NOTOKEN","IDENT","NUMBER",
+		     "SYMBOL","STRING","WHITESPACE",
+		     "COMMENT","DIRECTIVE","QUOTEDCHAR"]
+	
+	def __init__(this, type=0, value=""):
+		this.type = type
+		this.value = value
+		this.pos = None
+		this.directive = ""
+		if type == this.WHITESPACE: this.nl = "\n" in value
+		else: this.nl = 0
+		return
+
+	def __eq__(this, tok):
+		if not tok: return 0
+		return this.type == tok.type and this.value == tok.value
+
+	def __ne__(this, tok):
+		if not tok: return 1
+		return this.type != tok.type or this.value != tok.value
+
+	def setPosition(this, pos):
+		this.pos = pos
+		return
+
+	def getPosition(this):
+		return this.pos
+
+	def isIdentifier(this):
+		return this.type == this.IDENT
+
+	def isNumber(this):
+		return this.type == this.NUMBER
+
+	def isSymbol(this):
+		return this.type == this.SYMBOL
+
+	def isQuotedchar(this):
+		return this.type == this.QUOTEDCHAR
+
+	def isString(this):
+		return this.type == this.STRING
+
+	def isDirective(this):
+		return this.type == this.DIRECTIVE
+
+	def isWhitespace(this):
+		return this.type == this.WHITESPACE
+
+	def isNewline(this):
+		return this.nl
+
+	def isComment(this):
+		return this.type == this.COMMENT
+
+	def isIgnore(this):
+		return this.isWhitespace() or this.isComment()
+
+	def typeAsString(this):
+		return this.typeNames[this.type]
+
+	def toString(this):
+		return "Tok %s %s" %(this.typeAsString(), this.value)
+	
+	pass
+	
+class Tokenizer:
+	identifier_re = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+	number_re = re.compile(r"([0-9]+|[0-9]*\.[0-9]+|\$[0-9a-fA-F]+|%[10#.]+)")
+	stringliteral_re = re.compile(r'"(([^\\"]|\\.)*)"')
+	characterliteral_re = re.compile(r"'(([^\\']|\\.)*)'")
+	whitespace_re = re.compile(r"\s+")
+	asmcomment_re = re.compile(r";.*")
+	directive_re = re.compile("^\s*#([a-z]+)")
+	quotedchar_re = re.compile(r"(?:^|[^\\](?:\\\\)*)\\(.)")
+	quotedeol_re = re.compile(r"(?:^|[^\\](?:\\\\)*)\\\n")
+
+	def __init__(this, input):
+		this.input = input
+		this.line = ""
+		this.idx = 0
+		this.eoi = 0
+		this.peekedToken = None
+		return
+
+	def _nextLine(this):
+		this.line = ""
+		this.idx = 0
+		if this.eoi: return
+		while 1:
+			nextline = this.input.getLine()
+			if nextline == "":
+				this.eoi = 1
+				return
+			
+			this.line += nextline
+
+			(this.line, subcount) = this.quotedeol_re.subn(" ",this.line)
+			if not subcount: return
+			pass
+		return 
+
+	def eof(this):
+		return this.eoi and this.line == ""
+
+	def nextToken(this):
+		if this.peekedToken:
+			res = this.peekedToken
+			this.peekedToken = None
+			return res
+
+		fresh_line = 0
+		mo = None
+
+		if this.idx >= len(this.line):
+			this._nextLine()
+			fresh_line = 1
+			pass
+
+		if this.eof(): return None
+
+		if fresh_line: mo=this.directive_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			tok = Token(Token.DIRECTIVE, mo.group())
+			tok.directive = mo.group(1)
+			return tok
+
+		mo=this.whitespace_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			tok = Token(Token.WHITESPACE, mo.group())
+			if tok.isNewline(): tok.setPosition(this.input.getPosition())
+			return tok
+
+		# matching erst mit numbers, sonst ist .0 Bezeichner
+		mo=this.number_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			return Token(Token.NUMBER,mo.group())
+
+		mo=this.identifier_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			return Token(Token.IDENT,mo.group())
+
+		mo=this.stringliteral_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			res = Token(Token.STRING,mo.group())
+			res.string = this.quotedchar_re.sub(r"\1", mo.group()[1:-1])
+			return res
+
+		mo=this.characterliteral_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			res = Token(Token.STRING,mo.group())
+			res.string = this.quotedchar_re.sub(r"\1", mo.group()[1:-1])
+			return res
+
+		mo=this.asmcomment_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			return Token(Token.COMMENT,mo.group())
+
+		mo=this.quotedchar_re.match(this.line,this.idx)
+		if mo:
+			this.idx = mo.end()
+			res = Token(Token.QUOTEDCHAR, mo.group())
+			res.char = mo.group(1)
+			return res
+
+		res = this.line[this.idx]
+		this.idx += 1
+		return Token(Token.SYMBOL,res)
+
+	def peek(this):
+		if not this.peekedToken: this.peekedToken = this.nextToken()
+		return this.peekedToken
+
+	def nextParenExpr(this):
+		"""if the next token is an open parentheses, returns \na list of all tokens in the matching parentheses pair \nincluding the parentheses. returns empty list otherwise."""
+		res = []
+		tok = this.peek()
+		if tok.value != "(": return res
+		res.append(this.nextToken())
+		depth = 1
+		while (depth>0 and not this.eof()):
+			res.append(this.nextToken())
+			if res[-1].value == "(": depth+=1
+			if res[-1].value == ")": depth-=1
+			pass
+		return res
+
+	def scanForToken(this, criterion):
+		# liest so lange Tokens ein, bis criterion erfuellt oder keine
+		# weiteren Tokens verfuegbar sind. alle gelesenen Tokens
+		# werden zurueckgegeben
+		# criterion ist String (test auf token.value) oder Kriteriumsfunktion
+		if type(criterion)==StringType: criterion = lambda x:x.value == criterion
+		
+		res = []
+		while 1:
+			tok = this.nextToken()
+			if not tok: break
+			res.append(tok)
+			if criterion(tok): break
+			pass
+		return res
+
+	pass
+
+
+class Macro:
+	
+	# *args = ( dont_test_recursiveness )
+	def __init__(this, nameTok, paramToks, valueToks, *args):
+		# paramToks = Liste der Parameter als Identifier,
+		# None fuer parameterlose Makros ohne Klammern
+		if type(nameTok) == StringType: nameTok = Token(Token.IDENT, nameTok)
+		if type(valueToks) == StringType: valueToks = [Token(Token.STRING, valueToks)]
+
+		if not nameTok.isIdentifier():
+			raise PPException("Not a valid macro name: %s" % nameTok.value)
+
+		# Parameternamen muessen nicht im Objekt gespeichert werden, weil
+		# ueber Position eindeutig bestimmt, fuer Debugging-Ausgaben aber
+		# trotzdem nuetzlich
+		this.params = paramToks
+		this.name = nameTok
+		
+		# test auf rekursiv nur, wenn nicht explizit ausgeschaltet (...,1)
+		if (not len(args) or not args[0]):
+			(start,end,dummyparams) = this._findInvocation(valueToks)
+			if start >=0: raise PPException("Recursive macro definition not allowed")
+			pass
+
+		# Umformen von value in Liste von (tokens, parameternummer) zur
+		# effizienten expansion
+
+		this.valueSnippets = []
+		toks=[]
+
+		if not this.params:
+			this.lastSnippet = valueToks
+		else:
+			for i in range(len(valueToks)):
+				if not valueToks[i].isIdentifier():
+					toks.append(valueToks[i])
+					continue
+				
+				if valueToks[i] in this.params:
+					this.valueSnippets.append((toks, this.params.index(valueToks[i])))
+					toks = []
+					continue
+				
+				toks.append(valueToks[i])
+				pass
+			this.lastSnippet = toks
+			pass
+			
+		log.debug("Macro defined: %s" % nameTok.value)
+		return
+
+	# liefert (anfangsposition, endposition, parameterliste) des ersten makroaufrufes
+	# (-1,-1,None) wenn nicht gefunden
+	def _findInvocation(this, tokens, start=0):
+		for i in range(start,len(tokens)):
+			if tokens[i] != this.name: continue
+			
+			if not this.params: return (i,i+1,[])
+
+			params = []
+			param = []
+			j=i+1			
+			
+			if j == len(tokens) or tokens[j].value != "(": continue
+
+			depth = 1
+			while depth>0 and j+1 < len(tokens):
+				j=j+1
+				if tokens[j].isQuotedchar():
+					param.append(Token(Token.SYMBOL, tokens[j].char))
+					continue
+				
+				v=tokens[j].value
+				if v == "(":
+					depth+=1
+					if depth>1: param.append(tokens[j])
+					continue
+				if v == ")":
+					depth-=1
+					if depth>0: param.append(tokens[j])
+					else:
+						params.append(param)
+						return (i,j+1,params)
+					continue
+				if v == "," and depth == 1:
+					params.append(param)
+					param = []
+					continue
+
+				param.append(tokens[j])
+				pass
+			pass
+		return (-1,-1,None)
+
+	def expand(this, params):
+		# liefert das Ergebnis der Parametereinsetzung zurueck
+		pCount = 0
+		if this.params: pCount = len(this.params)
+		if pCount != len(params):
+			if pCount != 0 or len(params) != 1:
+				log.warning("wrong number of args for Makro %s"%this.name.value)
+				pass
+			pass
+		
+		while len(params)<pCount: params.append([])
+		
+		res = []
+		for (toks, pnr) in this.valueSnippets:
+			res.extend(toks)
+			res.extend(params[pnr])
+			pass
+		
+		res.extend(this.lastSnippet)
+		return res
+	
+	def apply(this, tokens, start=0):
+		# wertet ersten Makroaufruf auf tokens aus; (startindex des makroaufrufs, endindex, expansion)
+		# suche nach makroaufruf beginnt bei index start
+		(mbegin, mend, params) = this._findInvocation(tokens, start)
+
+		if mbegin < 0: return (0,0,[])
+		return (mbegin, mend, this.expand(params))
+		
+	pass
+
+
+class Prepro:
+	"""Simple preprocessor for assembler macros etc."""
+
+	def __init__(this):
+		this.includedirs = ['.']
+		this.macros = {}
+		this.multilinemacro = None
+		this.pythoncode = None
+		this.ifscope = []
+		this.thenscope = []
+		this.linedirs = 0
+		this.defineMacro("__FILE__",None,"")
+		this.defineMacro("__LINE__",None,"")
+		this.defineMacro("__NLVL__",None,"")
+		this.eval_globals = {}
+		this.setOutput(sys.stdout)
+		pass
+
+	def setOutput(this,output):
+		this.out = output		
+		pass
+
+	def printLineDirs(this, doit):
+		this.linedirs = doit
+		pass
+
+	def addDirectory(this,dirname):
+		this.includedirs.append(dirname)
+		pass
+
+	def _constructMacro(this, name, params, value):
+		try: 
+			return Macro(name, params, value)
+		except PPException,e:
+			log.error(e.message)
+			pass
+		except:
+			log.error("Error constructing macro %s: %s" % (name.value, sys.exc_info()[1]))
+			pass
+		return None
+
+	def _registerMacro(this, macro):
+		if not macro: return
+		name = macro.name.value
+		if this.macros.has_key(name): 
+			log.warning("Duplicate definition of macro '%s'" % name)
+			pass
+		this.macros[name] = macro
+		return
+		
+
+	def defineMacro(this, name, params, value):
+		# name ist Identifier oder String
+		# params,value sind Tokenlisten;
+		# Ausnahme: wenn params leer ist, darf value auch String sein (fuer -DA=1)
+		if type(name) == StringType:
+			name = Token(Token.IDENT, name)
+			pass
+
+		if ((not params) or len(params)==0) and type(value)==StringType:
+			value = [Token(Token.STRING, value)]
+			pass
+
+		macro = this._constructMacro(name, params, value)
+		this._registerMacro(macro)
+		pass
+
+	def undefineMacro(this, name):
+		if isinstance(name, Token): name = name.value
+		if not this.macros.has_key(name):
+			log.warning("Trying to undefine undefined macro '%s'" %name)
+			return
+
+		del(this.macros[name])
+		pass
+
+	def is_processing(this):
+		return reduce(lambda x,y:x and y, this.ifscope, 1)
+
+	def _getLine(this):
+		res = []
+		while 1:
+			tok = this.tokenizer.nextToken()
+			if not tok: break
+			res.append(tok)
+			if tok.isNewline(): break
+			pass
+		return res
+
+	def process(this, input):
+		this.input = input
+		this.tokenizer = Tokenizer(input)
+		log.setInput(input)
+		while 1:
+			tok = this.tokenizer.peek()
+			if not tok: break
+			
+			if tok.isDirective():
+				this.tokenizer.nextToken()
+				this.processDirective(tok)
+				continue
+			
+			this.processLine(this._getLine())
+			pass
+		pass 
+
+	def processDirective(this, tok):
+		dir = tok.directive
+
+		line = this._getLine()
+
+		if this.directives.has_key(dir):
+			if not (this.is_processing() or this.directives[dir][1]):
+				return
+			try:
+				this.directives[dir][0](this, line)
+			except TypeError, a: log.error(a)
+			except PPException, e: log.error(e.message)
+			return
+		
+		return
+
+	def _quoteFilename(this,filenm):
+		filenm = filenm.replace("\\","\\\\")
+		filenm = filenm.replace('"','\\"')
+		filenm = '"'+filenm+'"'
+		return filenm
+
+	def processLine(this, line, depth=0):
+		if not this.is_processing(): return
+
+		if depth >= 10:
+			log.error("Maximum macro expansion depth reached (%i iterations)" % depth)
+			return
+
+		if depth == 0:
+			(filenm,linenr) = this.input.getPosition()[0]
+			filenm = this._quoteFilename(filenm)
+			this.macros["__FILE__"].lastSnippet[0].value = filenm
+			this.macros["__LINE__"].lastSnippet[0].value = str(linenr)
+			this.macros["__NLVL__"].lastSnippet[0].value = depth
+			if this.linedirs: this.out.write(".line %i,%s,%i\n" % (linenr,filenm,depth))
+			pass
+
+		idx = 0
+		while idx < len(line):
+				
+			if line[idx].type != Token.IDENT:
+				this.out.write(line[idx].value)
+				pos = line[idx].getPosition()
+				if pos and depth > 0:
+					(filenm,linenr) = pos[0]
+					filenm = this._quoteFilename(filenm)
+					linenr += 1 # BLOED. Aber noetig.
+					this.macros["__FILE__"].lastSnippet[0].value = filenm
+					this.macros["__LINE__"].lastSnippet[0].value = str(linenr+1)
+					this.macros["__NLVL__"].lastSnippet[0].value = depth
+					if this.linedirs: this.out.write(".line %i,%s,%i\n" % (linenr,filenm,depth))
+					pass
+				idx += 1
+				continue
+
+			if not this.macros.has_key(line[idx].value):
+				this.out.write(line[idx].value)
+				idx += 1
+				continue
+				
+			(mbegin, mend, expansion) = this.macros[line[idx].value].apply(line, idx)
+			if mend <= idx:
+				# kein Makroaufruf gefunden (mend==0)
+				this.out.write(line[idx].value)
+				idx += 1
+				continue
+				
+			for i in range(idx,mbegin): this.out.write(line[i].value)
+			this.processLine(expansion, depth+1)
+			idx = mend
+			pass
+
+		return
+
+	def parseMacroDefinition(this, args):
+		# returns (name, parameter, value)
+		# parameter and value are token lists
+		for i in range(len(args)):
+			if args[i].isIdentifier(): break
+			if not args[i].isIgnore(): return (None,None,None)
+			pass
+		
+		if not args[i].isIdentifier(): return (None,None,None)
+		name = args[i]
+
+		i+=1
+		
+		if i == len(args): return (name, None, None)
+
+		if args[i].value != "(":
+			if args[i].isWhitespace(): i+=1
+			return (name, None, args[i:])
+
+		# hinter '('
+		params = []
+		lookingForIdents = 1
+		while i+1<len(args):
+			i+=1
+			if args[i].isIgnore(): continue
+			if args[i].value == ")": break
+			
+			if lookingForIdents and args[i].isIdentifier():
+				params.append(args[i])
+				lookingForIdents = 0
+				continue
+
+			if not lookingForIdents and args[i].value == ",":
+				lookingForIdents = 1
+				continue
+
+			return (None,None,None)
+
+		i+=1
+		if args[i].isIgnore(): i+=1
+		return (name, params, args[i:-1])
+	
+	def _stringFromTokens(this, tokens):
+		return "".join(map(lambda x:x.value, tokens))
+
+	def _filenameForInclude(this, tokens):
+		i=0
+		while i<len(tokens) and tokens[i].isWhitespace(): i+=1
+
+		if i == len(tokens):
+			raise PPException("Syntax error in filename list")
+
+		if tokens[i].isString():
+			filename = tokens[i].string
+		else:
+			if tokens[i].value != "<":
+				raise PPException('filenames expected as <fname> or "fname"')
+
+			filename = ""
+
+			i+=1
+			while i<len(tokens) and tokens[i].value != ">":
+				filename += tokens[i].value
+				i+=1
+				pass
+
+			if i == len(tokens):
+				raise PPException('filenames expected as <fname> or "fname"')
+			pass
+
+		return filename
+
+	def _readAsBin(this,openfile):
+		bs = 1024
+		while 1:
+			line = openfile.read(bs)
+			if line == "": break
+
+			i = 0
+			while (i<bs and i<len(line)):
+				this.out.write(".byte %i\n" % ord(line[i]))
+				i+=1
+			pass
+		return
+
+	def dir_define(this, args):
+		(name, params, args) = this.parseMacroDefinition(args)
+		if not name: raise PPException("Syntax error in macro definition")
+
+		this.defineMacro(name, params, args)
+		pass
+
+	def dir_undefine(this, args):
+		names = filter(lambda x:x.isIdentifier(), args)
+		for name in names:
+			this.undefineMacro(name.value)
+			pass
+		pass
+		
+	def dir_begindef(this, args):
+		sel = lambda x:x.directive=="enddef"
+		args.extend(this.tokenizer.scanForToken(sel))
+		(name, params, args) = this.parseMacroDefinition(args[:-1])
+		if not name: raise PPException("Syntax error in macro definition")
+
+		this.defineMacro(name, params, args)
+		pass
+
+	def dir_enddef(this, args):
+		raise PPException("#enddef without #begindef")
+	
+	def dir_pybegin(this, args):
+		sel = lambda x:x.directive =="pyend"
+		args.extend(this.tokenizer.scanForToken(sel))
+		try:
+			code = compile(this._stringFromTokens(args[:-1]),"[internal]","exec")
+			stdout = sys.stdout
+			sys.stdout = this.out
+			eval(code, this.eval_globals)
+			sys.stdout = stdout
+		except:
+			log.error(sys.exc_info()[1])
+			pass
+		pass
+	
+
+	def dir_pyend(this, args):
+		raise PPException("#endpython without #beginpython")
+		
+	def dir_include(this, args):
+		filename = this._filenameForInclude(args)
+		log.debug("looking for include file '%s'" % filename)
+
+		for pth in this.includedirs:
+			fileabs = os.path.join(pth, filename)
+			if os.access(fileabs, os.R_OK):
+				this.input.include(Input(fileabs))
+				return
+			pass
+		raise PPException("Include file not found: '%s'" % filename)
+
+	def dir_binfile(this, args):
+		filename = this._filenameForInclude(args)
+
+		for pth in this.includedirs:
+			fileabs = os.path.join(pth, filename)
+			if os.access(fileabs, os.R_OK):
+				file = open(fileabs,"r")
+				this._readAsBin(file)
+				return
+			pass
+		raise PPException("Include file not found: '%s'" % filename)
+
+	def dir_sysinclude(this, args):
+		this.input.include(PipeInput(this._stringFromTokens(args)))
+		pass
+
+	def dir_error(this, args):
+		log.error(this._stringFromTokens(args))
+		pass
+
+	def dir_warning(this, args):
+		log.warning(this._stringFromTokens(args))
+		pass
+
+	def dir_if(this, args):
+		this.ifscope.append(eval(this._stringFromTokens(args), this.eval_globals))
+		this.thenscope.append(this.ifscope[-1])
+		return
+	
+	def dir_ifdef(this, args):
+		names = filter(lambda x:x.isIdentifier(), args)
+		if len(names)==0: 
+			this.ifscope.append(1)
+			this.thenscope.append(1)
+			raise PPException("No macroname after ifdef")
+		
+		this.ifscope.append(reduce(lambda x,y: x and this.macros.has_key(y.value), names, 1))
+		this.thenscope.append(this.ifscope[-1])
+		return
+	
+	def dir_ifndef(this, args):
+		names = filter(lambda x:x.isIdentifier(), args)
+		if len(names)==0: 
+			this.ifscope.append(0)
+			this.thenscope.append(0)
+			raise PPException("No macroname after ifndef")
+
+		this.ifscope.append(reduce(lambda x,y: x and not this.macros.has_key(y.value), names, 1))
+		this.thenscope.append(this.ifscope[-1])
+		return
+	
+	def dir_elsif(this,args):
+		if len(this.ifscope)==0: raise PPException("else without if")
+		if this.thenscope[-1]: 
+			this.ifscope[-1]=0
+			return
+		this.ifscope[-1] = eval(this._stringFromTokens(args), this.eval_globals)
+		this.thenscope[-1] = this.ifscope[-1]
+		return
+	
+	def dir_elsifdef(this, args):
+		names = filter(lambda x:x.isIdentifier(), args)		
+		if len(this.ifscope)==0: raise PPException("else without if")
+		if len(names)==0: raise PPException("No macroname after elsifdef")
+		if this.thenscope[-1]: 
+			this.ifscope[-1]=0
+			return
+		this.ifscope[-1] = reduce(lambda x,y: x and this.macros.has_key(y.value), names, 1)
+		this.thenscope[-1] = this.ifscope[-1]
+		return
+
+	def dir_elsifndef(this, args):
+		names = filter(lambda x:x.isIdentifier(), args)
+		if len(this.ifscope)==0: raise PPException("else without if")
+		if len(names)==0: raise PPException("No macroname after elsifndef")
+		if this.thenscope[-1]:
+			this.ifscope[-1]=0
+			return
+		this.ifscope[-1] = reduce(lambda x,y: x and not this.macros.has_key(y.value), names, 1)
+		this.thenscope[-1] = this.ifscope[-1]
+		return
+
+	def dir_else(this,args):
+		if len(this.ifscope)==0: raise PPException("else without if")
+		if this.thenscope[-1]:
+			this.ifscope[-1]=0
+			return
+		this.ifscope[-1] = not this.ifscope[-1]
+		this.thenscope[-1] = this.ifscope[-1]
+		return
+
+	def dir_endif(this,args):
+		if len(this.ifscope)==0: raise PPException("endif without if")
+		this.ifscope.pop()
+		this.thenscope.pop()
+		return
+
+	def dir_system(this,args):
+		pipe = os.popen(this._stringFromTokens(args),"r")
+		while 1:
+			line = pipe.readline()
+			if line == "": break
+			this.out.write(line)
+			pass
+		failure = pipe.close()
+		if failure: log.error("command failed")
+		return
+
+	def dir_sysbin(this,args):
+		pipe = os.popen(this._stringFromTokens(args),"r")
+		this._readAsBin(pipe)
+		failure = pipe.close()
+		if failure: log.error("command failed")
+		return
+
+	directives = { "define": (dir_define,0),
+		       "undef": (dir_undefine,0),
+		       "begindef": ( dir_begindef,0),
+		       "enddef": ( dir_enddef,0),
+		       "pybegin": ( dir_pybegin,0),
+		       "pyend": ( dir_pyend,0),
+		       "include": ( dir_include,0),
+		       "sysinclude": ( dir_sysinclude, 0),
+		       "error": ( dir_error,0),
+		       "warning": ( dir_warning,0),
+		       "if": ( dir_if, 1), 
+		       "ifdef": ( dir_ifdef, 1), 
+		       "ifndef": ( dir_ifndef, 1), 
+		       "else": ( dir_else, 1),
+		       "endif": ( dir_endif, 1),
+		       "elsif": ( dir_elsif, 1),
+		       "elsifdef": ( dir_elsifdef, 1),
+		       "elsifndef": ( dir_elsifndef, 1),
+		       "system": ( dir_system, 0),
+		       "sysbin": ( dir_sysbin, 0),
+		       "binfile": ( dir_binfile, 0),
+		       }
+	
+	pass
+
+
+class Options:
+	"""Verwaltung und Auswertung der Kommandozeilenoptionen"""
+
+	def __init__(this):
+		this.prep = None
+		return
+
+	def usage(this,*args):
+		print "%s %s - an assembler preprocessor " % (prog_name, prog_release)
+		print "Usage: %s [OPTIONS] <file> ..." % sys.argv[0]
+		
+		def frm(i):
+			return ("  -"+i[this.SHORT].replace(':','')+i[this.PARAM]+" , "
+				+ "--"+i[this.LONG]+i[this.PARAM])
+		
+		maxlen = reduce(lambda x,y:max(x,len(frm(y))), this.optdefs, 0)
+			
+		for i in this.optdefs: print frm(i).ljust(maxlen+4), i[this.DOC]
+		sys.exit(1)
+		pass
+
+	def opt_include(this,arg):
+		this.prep.addDirectory(arg)
+		pass
+	
+	def opt_define(this,arg):
+		spl = re.split('=', arg, 1)
+		name = spl[0]
+		value = "1"
+		if len(spl)>1: value = spl[1]
+		this.prep.defineMacro(name, [], value)
+		pass
+	
+	def opt_undefine(this,arg):
+		this.prep.undefineMacro(arg)
+		pass
+
+	def opt_output(this,arg):
+		try:
+			out = open(arg,"w")
+			this.prep.setOutput(out)
+		except IOError:
+			log.error("Failed to open output file for writing: '%s'" % arg)
+			sys.exit(1)
+			pass
+		pass
+	
+	def opt_quiet(this,*args):
+		log.setOutput(Null())
+		pass
+	
+	def opt_lines(this,*args):
+		this.prep.printLineDirs(1)
+		pass
+	
+	def opt_showdirs(this,*args):
+		list = this.prep.directives.keys()
+		list.sort()
+		for d in list:
+			print "#"+d
+			pass
+		sys.exit(1)		
+		pass
+
+	# Spaltendefinitionen
+	SHORT=0
+	LONG=1
+	PARAM=2
+	DOC=3
+	CMD=4
+
+	optdefs = [
+		("h", "help", "", "Display this help message", usage),
+		("I:", 'includedir=','<DIR>','Add Directory to search path', opt_include),
+		("D:", 'define=','<NAME>=<VALUE>','Define macro', opt_define),		
+		("U:",'undefine=','<NAME>','Undefine macro', opt_undefine),
+		("o:",'output=','<FILENAME>','Output file', opt_output),
+		("q",'quiet','','Suppress warning and error messages', opt_quiet),
+		("l",'lines','','Insert line directives', opt_lines),
+		("s",'show-directives','','Show known preprocessor directives', opt_showdirs)
+		]
+
+	def apply(this, argl, prep):
+		shorts = reduce(lambda x,y:x+y[this.SHORT],this.optdefs,"")
+		longs = [ i[this.LONG] for i in this.optdefs]
+		this.prep = prep
+
+		try:
+			opts, args = getopt.getopt(argl, shorts, longs)
+		except getopt.GetoptError:
+			this.usage()
+			pass
+
+		optdict = {}
+		for o in this.optdefs:
+			optdict["-"+o[this.SHORT].replace(":","")] = o[this.CMD]
+			optdict["--"+o[this.LONG].replace("=","")] = o[this.CMD]
+			pass
+
+		for o,a in opts:
+			if optdict.has_key(o): optdict[o](this,a)
+			pass
+		
+		pv = os.getenv("K2PP_INCLUDEPATH")
+		if pv:
+			for pth in pv.split(":"): 
+				if len(pth.strip()): prep.addDirectory(pth.strip())
+				pass
+			pass
+		
+		return args
+
+	pass
+
+def main():
+	global log
+	log = Log()
+	o = Options()
+	prep = Prepro()
+	infiles = o.apply(sys.argv[1:], prep)
+
+	if len(infiles):
+		for f in infiles:
+			prep.process(Input(f))
+			pass
+	else:
+		prep.process(StreamInput(sys.stdin))
+		pass
+
+	if log.errorOccured: sys.exit(2)
+
+	pass
+
+def test():
+	f = open("test.txt")
+	i = StreamInput(f)
+	t = Tokenizer(i)
+
+	while 1:
+		tok=t.nextToken()
+		if not tok: break
+		if tok.isIdentifier():
+			print tok.value, 
+			print map(lambda x:x.value,t.nextParenExpr())
+		else: print tok.typeAsString(),tok.isNewline(),"\t",tok.value
+		pass
+	return
+
+if __name__ == "__main__":
+	main()
+	#test()
+	pass

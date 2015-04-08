@@ -1,0 +1,11 @@
+- weshalb ist MOD gleich DIV und umgekehrt (bin ich doof ?) 
+- in-scope adressierung ( vor allem fuer smod's )
+- implizites label "*"
+- implizites _return label
+- .string & petscii-schiss
+- fehlermeldungen
+- ldx,cpx abs,y adressierung
+- punkt vor stern
+- negative dezimale
+- debug output linux-TERM konform
+- Positionsangaben nur an Newlines -> Ueberspringen von NestedLevels moeglich
